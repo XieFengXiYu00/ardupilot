@@ -57,15 +57,16 @@
 
 extern const AP_HAL::HAL &hal;
 
-AP_Compass_Backend *AP_Compass_QMC5883L::probe(AP_HAL::OwnPtr<AP_HAL::I2CDevice> dev,
-                                               bool force_external,
-                                               enum Rotation rotation)
+AP_Compass_Backend *AP_Compass_QMC5883L::probe(Compass &compass,
+                                              AP_HAL::OwnPtr<AP_HAL::I2CDevice> dev,
+											  bool force_external,
+											  enum Rotation rotation)
 {
     if (!dev) {
         return nullptr;
     }
 
-    AP_Compass_QMC5883L *sensor = new AP_Compass_QMC5883L(std::move(dev),force_external,rotation);
+    AP_Compass_QMC5883L *sensor = new AP_Compass_QMC5883L(compass, std::move(dev),force_external,rotation);
     if (!sensor || !sensor->init()) {
         delete sensor;
         return nullptr;
@@ -74,10 +75,12 @@ AP_Compass_Backend *AP_Compass_QMC5883L::probe(AP_HAL::OwnPtr<AP_HAL::I2CDevice>
     return sensor;
 }
 
-AP_Compass_QMC5883L::AP_Compass_QMC5883L(AP_HAL::OwnPtr<AP_HAL::Device> dev,
-                                         bool force_external,
-                                         enum Rotation rotation)
-    : _dev(std::move(dev))
+AP_Compass_QMC5883L::AP_Compass_QMC5883L(Compass &compass,
+                                       AP_HAL::OwnPtr<AP_HAL::Device> dev,
+									   bool force_external,
+									   enum Rotation rotation)
+    : AP_Compass_Backend(compass)
+    , _dev(std::move(dev))
     , _rotation(rotation)
 	, _force_external(force_external)
 {
@@ -88,15 +91,16 @@ bool AP_Compass_QMC5883L::init()
     if (!_dev->get_semaphore()->take(HAL_SEMAPHORE_BLOCK_FOREVER)) {
         return false;
     }
+    //must reset first
+    _dev->write_register(QMC5883L_REG_CONF2,QMC5883L_RST);
 
     _dev->set_retries(10);
 
-#if 0
-    _dump_registers();
-#endif
-
-    if(!_check_whoami()){
-    	 goto fail;
+    uint8_t whoami;
+    if (!_dev->read_registers(QMC5883L_REG_ID, &whoami,1)||
+    		whoami != QMC5883_ID_VAL){
+        // not an QMC5883L
+        goto fail;
     }
 
     if (!_dev->write_register(0x0B, 0x01)||
@@ -139,21 +143,6 @@ bool AP_Compass_QMC5883L::init()
     _dev->get_semaphore()->give();
     return false;
 }
-bool AP_Compass_QMC5883L::_check_whoami()
-{
-    uint8_t whoami;
-    //Affected by other devices,must read registers 0x00 once or reset,after can read the ID registers reliably
-    _dev->read_registers(0x00,&whoami,1);
-    if (!_dev->read_registers(0x0C, &whoami,1)||
-      		whoami != 0x01){
-    	return false;
-    }
-    if (!_dev->read_registers(QMC5883L_REG_ID, &whoami,1)||
-    		whoami != QMC5883_ID_VAL){
-    	return false;
-    }
-    return true;
-}
 
 void AP_Compass_QMC5883L::timer()
 {
@@ -166,6 +155,12 @@ void AP_Compass_QMC5883L::timer()
     const float range_scale = 1000.0f / 3000.0f;
 
     uint8_t status;
+
+    uint8_t status_temp1;
+    uint8_t status_temp2;
+	Vector3f log_raw_mag;
+
+    static uint8_t num=0;
     if(!_dev->read_registers(QMC5883L_REG_STATUS,&status,1)){
     	return;
     }
@@ -173,14 +168,56 @@ void AP_Compass_QMC5883L::timer()
     if (!(status & 0x04)) {
     	return;
     }
+   	num++;
+     
+	if (status == 0x05) {
+    	num=0;
+    }
 
   if(!_dev->read_registers(QMC5883L_REG_DATA_OUTPUT_X, (uint8_t *) &buffer, sizeof(buffer))){
 	  return ;
   }
 
+    uint32_t now = AP_HAL::micros();
+
     auto x = -static_cast<int16_t>(le16toh(buffer.rx));
     auto y = static_cast<int16_t>(le16toh(buffer.ry));
     auto z = -static_cast<int16_t>(le16toh(buffer.rz));
+    //if the data is not updating in 0.2s,soft reset QMC5883
+    if(num>20){
+	
+    	//RESET QMC5883L and test the reset QMC5883L_REG_CONF1,0x00 means successful
+    	_dev->write_register(0x0A, 0x80);
+
+    	_dev->read_registers(QMC5883L_REG_CONF1,&status_temp1,1);
+    	if(!(status_temp1==0x00)){
+    		//printf("timer test 00000 status_temp1=%d\r\n",status_temp1);
+    		return;
+    	}
+
+    	//reload  QMC5883L_REG_CONF1 value into continues mode
+    	_dev->write_register(0x0B, 0x01);
+    	_dev->write_register(0x20, 0x40);
+    	_dev->write_register(0x21, 0x01);
+    	_dev->write_register(QMC5883L_REG_CONF1,
+    							QMC5883L_MODE_CONTINUOUS|
+    							QMC5883L_ODR_100HZ|
+    							QMC5883L_OSR_512|
+    							QMC5883L_RNG_8G);
+
+     	_dev->read_registers(QMC5883L_REG_CONF1,&status_temp2,1);
+
+    	if(!(status_temp2==0x19)){
+    		//printf("timer test 22222 status_temp2=%d\r\n",status_temp2);
+    		return;
+    	}
+
+    	
+    	//uint32_t all_time=after_time-before_time;
+    	//printf("QMC5883 init all_time=%d  num=%d 0000\r\n",all_time,num);
+    	num=0;
+    }
+
 
 #if 0
     printf("mag.x:%d\n",x);
@@ -188,6 +225,13 @@ void AP_Compass_QMC5883L::timer()
     printf("mag.z:%d\n",z);
 #endif
 
+	//
+	//Vector3f log_raw_mag;
+	//log_raw_mag.x = x * range_scale;
+	//log_raw_mag.y = y * range_scale;
+	log_raw_mag.z = z * range_scale;
+	publish_log_raw_mag_data(log_raw_mag,  _instance);
+	
     Vector3f field = Vector3f{x * range_scale , y * range_scale, z * range_scale };
 
     // rotate to the desired orientation
@@ -195,24 +239,46 @@ void AP_Compass_QMC5883L::timer()
         field.rotate(ROTATION_YAW_90);
     }
 
-    accumulate_sample(field, _instance, 20);
+    /* rotate raw_field from sensor frame to body frame */
+    rotate_field(field, _instance);
+
+    /* publish raw_field (uncorrected point sample) for calibration use */
+    publish_raw_field(field, now, _instance);
+
+    /* correct raw_field for known errors */
+    correct_field(field, _instance);
+
+    if (_sem->take(HAL_SEMAPHORE_BLOCK_FOREVER)) {
+        _accum += field;
+        _accum_count++;
+        if(_accum_count == 20){
+        	_accum.x /= 2;
+        	_accum.y /= 2;
+        	_accum.z /= 2;
+        	_accum_count = 10;
+        }
+        _sem->give();
+    }
 }
 
 void AP_Compass_QMC5883L::read()
 {
-    drain_accumulated_samples(_instance);
-}
+    if (!_sem->take_nonblocking()) {
+        return;
+    }
 
-void AP_Compass_QMC5883L::_dump_registers()
-{
-	  printf("QMC5883L registers dump\n");
-	    for (uint8_t reg = QMC5883L_REG_DATA_OUTPUT_X; reg <= 0x30; reg++) {
-	        uint8_t v;
-	        _dev->read_registers(reg,&v,1);
-	        printf("%02x:%02x ", (unsigned)reg, (unsigned)v);
-	        if ((reg - ( QMC5883L_REG_DATA_OUTPUT_X-1)) % 16 == 0) {
-	            printf("\n");
-	        }
-	    }
-}
+    if (_accum_count == 0) {
+        _sem->give();
+        return;
+    }
 
+    Vector3f field(_accum);
+    field /= _accum_count;
+
+    publish_filtered_field(field, _instance);
+
+    _accum.zero();
+    _accum_count = 0;
+
+    _sem->give();
+}
